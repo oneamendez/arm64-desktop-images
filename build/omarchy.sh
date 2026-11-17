@@ -5,11 +5,12 @@
 #
 #     build/omarchy.sh OUT
 #
-# Installed the way Omarchy's ISO and its factory images install it: pacstrap
-# of base and linux-omarchy, omarchy-dev and the aarch64 default set. The owner
-# is set up on the first boot instead (see vendor-data/omarchy.yaml), and
-# Omarchy's hardware setup is deferred to that boot as its image builds defer
-# it. The repository key in omarchy/ is Omarchy's, from omacom-io/omarchy-pkgs
+# Installed the way Omarchy's ISO and factory images install it: pacstrap base,
+# linux-omarchy, omarchy-dev and the aarch64 default set, then run Omarchy's
+# system setup while the image manifest makes it defer hardware-specific work.
+# That queue runs on the machine's first boot, before its display manager. The
+# owner is made by cloud-init and finalized by vendor-data/omarchy.yaml. The
+# repository key in omarchy/ is Omarchy's, from omacom-io/omarchy-pkgs
 # (fingerprint 40DFB630FF42BCFFB047046CF0134EE680CAC571).
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -81,8 +82,9 @@ for name in "${defaults[@]}"; do
         echo "omarchy: $name isn't available for aarch64"
     fi
 done
-# Snapper because Omarchy's system setup configures it and stops without it.
-install_pkgs "${available[@]}" snapper cloud-init
+# Snapper because Omarchy's system setup configures it and stops without it;
+# btrfs-progs also grows crate's partitionless filesystem on first boot.
+install_pkgs "${available[@]}" snapper cloud-init btrfs-progs
 
 # --- system ---------------------------------------------------------------------
 uuid=$(cat /proc/sys/kernel/random/uuid)
@@ -100,10 +102,24 @@ echo 'LANG=en_US.UTF-8' > "$T/etc/locale.conf"
 printf 'KEYMAP=us\nXKBLAYOUT=us\n' > "$T/etc/vconsole.conf"
 ln -sfn /usr/share/zoneinfo/UTC "$T/etc/localtime"
 
-# An image: the hardware setup describes the machine it runs on, so Omarchy
-# runs it on the first boot rather than here.
+# Mark this as an image before system setup. Omarchy will configure everything
+# independent of hardware now, queue the hardware leaves, and arm its service
+# to run them on the actual machine before the first login screen.
 install -d -m 0755 "$T/var/lib/omarchy/image"
 printf 'format=1\nplatform=aarch64\nbuilder=image\nchannel=edge\n' > "$T/var/lib/omarchy/image/target"
+
+# The staging tree is not Btrfs until it is packed below. Prevent Snapper's
+# system setup from trying to create a Btrfs subvolume in the builder's
+# overlay; crate-grow-root creates the real subvolume on the first boot.
+install -d -m 0755 "$T/etc/snapper/configs" "$T/.snapshots"
+: > "$T/etc/snapper/configs/root"
+
+in_root "$builder" arch-chroot /target env \
+    OMARCHY_PATH=/usr/share/omarchy \
+    OMARCHY_INSTALL=/usr/share/omarchy/install \
+    OMARCHY_INSTALL_LOG_FILE=/var/log/omarchy-install.log \
+    OMARCHY_LOG_TO_STDOUT=1 \
+    /usr/bin/omarchy-apply-system --defer-provisioning --first-install
 
 for unit in cloud-init-main cloud-init-local cloud-init-network cloud-init cloud-config cloud-final; do
     [ -e "$T/usr/lib/systemd/system/$unit.service" ] && in_root "$builder" arch-chroot /target systemctl enable "$unit.service"
@@ -125,6 +141,41 @@ else
 fi
 ln -sfn ../run/systemd/resolve/stub-resolv.conf "$T/etc/resolv.conf"
 common_rootfs "$T"
+
+# crate expands the raw disk sparsely to the size selected during install.
+# Btrfs otherwise keeps the smaller size it had when this artifact was built.
+# Resize on every boot so a later disk expansion is picked up as well; at the
+# current size this is an inexpensive no-op. The image's empty .snapshots
+# directory becomes a Btrfs subvolume before Snapper can use it.
+install -d -m 0755 "$T/usr/local/sbin"
+cat > "$T/usr/local/sbin/crate-prepare-btrfs" <<'EOF'
+#!/bin/sh
+set -eu
+
+/usr/bin/btrfs filesystem resize max /
+if ! /usr/bin/btrfs subvolume show /.snapshots >/dev/null 2>&1; then
+    if [ -d /.snapshots ]; then
+        rmdir /.snapshots
+    fi
+    /usr/bin/btrfs subvolume create /.snapshots
+fi
+EOF
+chmod 0755 "$T/usr/local/sbin/crate-prepare-btrfs"
+
+cat > "$T/etc/systemd/system/crate-grow-root.service" <<'EOF'
+[Unit]
+Description=Prepare Omarchy's Btrfs filesystem for crate
+After=local-fs.target
+Before=cloud-init-main.service cloud-init.service cloud-final.service omarchy-provision-hardware.service display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/crate-prepare-btrfs
+
+[Install]
+WantedBy=multi-user.target
+EOF
+in_root "$builder" arch-chroot /target systemctl enable crate-grow-root.service
 
 # --- kernel and initrd -------------------------------------------------------------
 # linux-omarchy is a plain arm64 Image with virtio and btrfs built in, so the

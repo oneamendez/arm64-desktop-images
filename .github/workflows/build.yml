@@ -5,9 +5,7 @@ on:
     inputs:
       images:
         description: Images in the catalog, separated by spaces
-        # omarchy still builds when named here, but stays out of the catalog
-        # until its bugs are fixed.
-        default: debian-kde debian-xfce ubuntu-gnome arch-kde arch-xfce
+        default: debian-kde debian-xfce ubuntu-gnome arch-kde arch-xfce omarchy
       rebuild:
         description: Rebuild only images whose recipe changed since the last release, or all of them
         type: choice

@@ -1,17 +1,22 @@
 #cloud-config
-# Omarchy's own setup for the owner cloud-init made, as its installer runs it:
-# the system part for that user, then the user's own; then SDDM, which waits
-# for this, logs them straight into Omarchy.
+# The image build has already run Omarchy's system setup and queued its
+# hardware setup for a first-boot service. Here cloud-init only finishes the
+# owner it made. SDDM waits for cloud-final, then logs them into Omarchy.
 write_files:
   - path: /etc/sddm.conf.d/autologin.conf
     content: |
       [Autologin]
       User={{user}}
       Session=omarchy.desktop
+  - path: /etc/sudoers.d/00-omarchy-wheel
+    permissions: '0440'
+    content: |
+      %wheel ALL=(ALL:ALL) ALL
 runcmd:
-  - [env, OMARCHY_PATH=/usr/share/omarchy, OMARCHY_INSTALL=/usr/share/omarchy/install,
-     OMARCHY_INSTALL_LOG_FILE=/var/log/omarchy-install.log,
-     /usr/bin/omarchy-apply-system, --install-user, "{{user}}", --first-install]
+  - [usermod, -aG, wheel, "{{user}}"]
+  # Be explicit about the first boot's network. System setup enabled it in the
+  # image; --now also recovers if another unit left it inactive during boot.
+  - [systemctl, enable, --now, NetworkManager.service]
   - [runuser, -u, "{{user}}", --, env, "HOME=/home/{{user}}", "USER={{user}}", "LOGNAME={{user}}",
      SHELL=/bin/bash, LANG=C.UTF-8, OMARCHY_PATH=/usr/share/omarchy,
      OMARCHY_INSTALL=/usr/share/omarchy/install, OMARCHY_SETUP_CONTEXT=provision-owner,
